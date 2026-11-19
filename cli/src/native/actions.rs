@@ -19739,6 +19739,100 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
         assert!(!setup.is_empty());
     }
 
+    /// Records CDP commands from one connection. `Browser.getWindowForTarget`
+    /// answers with a window id so `set_viewport` can resize the content area.
+    async fn viewport_cdp_log() -> (String, std::sync::Arc<std::sync::Mutex<Vec<Value>>>) {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = seen.clone();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while let Some(Ok(Message::Text(text))) = ws.next().await {
+                let cmd: Value = serde_json::from_str(&text).unwrap();
+                record.lock().unwrap().push(cmd.clone());
+                let result = if cmd["method"] == "Browser.getWindowForTarget" {
+                    json!({ "windowId": 7, "bounds": { "width": 800, "height": 600 } })
+                } else {
+                    json!({})
+                };
+                let response = json!({ "id": cmd["id"], "result": result });
+                if ws
+                    .send(Message::Text(response.to_string().into()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        (url, seen)
+    }
+
+    fn browser_on_page(client: CdpClient, url: String) -> BrowserManager {
+        let mut browser = BrowserManager::for_test(client, url);
+        browser.add_page(super::super::browser::PageInfo {
+            tab_id: 1,
+            label: None,
+            target_id: "page-1".to_string(),
+            session_id: "session-1".to_string(),
+            url: "about:blank".to_string(),
+            title: String::new(),
+            target_type: "page".to_string(),
+        });
+        browser
+    }
+
+    #[tokio::test]
+    async fn relaunch_reinstalls_the_viewport_override() {
+        let (url, seen) = viewport_cdp_log().await;
+        let client = CdpClient::connect(&url).await.unwrap();
+        let mut state = DaemonState::new();
+        state.browser = Some(browser_on_page(client, url));
+        state.viewport = Some((800, 600, 2.0, true));
+
+        restore_viewport_after_launch(&mut state).await.unwrap();
+
+        let seen = seen.lock().unwrap();
+        let metrics = seen
+            .iter()
+            .find(|cmd| cmd["method"] == "Emulation.setDeviceMetricsOverride")
+            .expect("device metrics override");
+        assert_eq!(metrics["sessionId"], "session-1");
+        assert_eq!(metrics["params"]["width"], 800);
+        assert_eq!(metrics["params"]["height"], 600);
+        assert_eq!(metrics["params"]["deviceScaleFactor"], 2.0);
+        assert_eq!(metrics["params"]["mobile"], true);
+        let contents = seen
+            .iter()
+            .find(|cmd| cmd["method"] == "Browser.setContentsSize")
+            .expect("content size");
+        assert_eq!(contents["params"]["windowId"], 7);
+        assert_eq!(contents["params"]["width"], 800);
+        assert_eq!(contents["params"]["height"], 600);
+    }
+
+    #[tokio::test]
+    async fn relaunch_without_a_viewport_leaves_metrics_alone() {
+        let (url, seen) = viewport_cdp_log().await;
+        let client = CdpClient::connect(&url).await.unwrap();
+        let mut state = DaemonState::new();
+        state.browser = Some(browser_on_page(client, url));
+
+        restore_viewport_after_launch(&mut state).await.unwrap();
+
+        let seen = seen.lock().unwrap();
+        assert!(
+            seen.iter()
+                .all(|cmd| cmd["method"] != "Emulation.setDeviceMetricsOverride"),
+            "a session with no viewport must not install an override: {seen:?}"
+        );
+    }
+
     #[test]
     fn test_init_script_handles_are_independent_from_session_identifiers() {
         let mut setup = SessionSetup::default();

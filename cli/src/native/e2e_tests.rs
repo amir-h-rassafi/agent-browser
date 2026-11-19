@@ -9998,6 +9998,154 @@ async fn e2e_relaunch_on_options_change() {
 }
 
 // ---------------------------------------------------------------------------
+// Regression: issue #2660 — a relaunch keeps `set viewport`
+// ---------------------------------------------------------------------------
+
+/// `--window-size` sizes the window frame. After `set viewport`, a relaunch
+/// (a changed launch flag, or `--relaunch`) must install the device-metrics
+/// override again, or the page is shorter than the frame by the browser chrome
+/// and screenshots come out that size.
+#[tokio::test]
+#[ignore]
+async fn e2e_viewport_survives_relaunch() {
+    let guard = EnvGuard::new(&[
+        "AGENT_BROWSER_SOCKET_DIR",
+        "AGENT_BROWSER_SESSION",
+        "AGENT_BROWSER_ALLOW_FILE_ACCESS",
+    ]);
+    let socket_dir = std::env::temp_dir().join(format!(
+        "agent-browser-e2e-viewport-relaunch-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&socket_dir).expect("socket dir");
+    guard.set(
+        "AGENT_BROWSER_SOCKET_DIR",
+        socket_dir.to_str().expect("socket dir is utf-8"),
+    );
+    guard.set("AGENT_BROWSER_SESSION", "e2e-viewport-relaunch");
+    guard.remove("AGENT_BROWSER_ALLOW_FILE_ACCESS");
+
+    let mut state = DaemonState::new();
+
+    // The daemon always has a stream server, and relaunch reads its viewport
+    // for `--window-size`. Match that so the test hits the same path.
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "stream_enable", "port": 0 }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({ "id": "2", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({ "id": "3", "action": "navigate", "url": "about:blank" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({ "id": "4", "action": "viewport", "width": 800, "height": 600 }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({ "id": "5", "action": "evaluate", "script": "window.innerWidth" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["result"].as_i64(), Some(800));
+
+    let resp = execute_command(
+        &json!({ "id": "6", "action": "evaluate", "script": "window.innerHeight" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["result"].as_i64(), Some(600));
+
+    // A launch flag that was not set before forces a new browser process.
+    let resp = execute_command(
+        &json!({
+            "id": "7",
+            "action": "navigate",
+            "url": "about:blank",
+            "settings": { "allow-file-access": true }
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(
+        get_data(&resp)["lifecycle"]["relaunchedBrowser"],
+        true,
+        "allow-file-access must relaunch, got: {}",
+        resp
+    );
+
+    let resp = execute_command(
+        &json!({ "id": "8", "action": "evaluate", "script": "window.innerWidth" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(
+        get_data(&resp)["result"].as_i64(),
+        Some(800),
+        "innerWidth dropped after relaunch: {}",
+        resp
+    );
+
+    let resp = execute_command(
+        &json!({ "id": "9", "action": "evaluate", "script": "window.innerHeight" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(
+        get_data(&resp)["result"].as_i64(),
+        Some(600),
+        "innerHeight dropped after relaunch: {}",
+        resp
+    );
+
+    let shot = std::env::temp_dir().join(format!(
+        "agent-browser-e2e-viewport-relaunch-{}.png",
+        uuid::Uuid::new_v4()
+    ));
+    let resp = execute_command(
+        &json!({
+            "id": "10",
+            "action": "screenshot",
+            "path": shot.to_str().unwrap()
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let img = image::open(&shot).expect("decode screenshot").to_rgb8();
+    let _ = std::fs::remove_file(&shot);
+    assert_eq!(
+        img.dimensions(),
+        (800, 600),
+        "screenshot should match the viewport, not the window frame"
+    );
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+    let _ = std::fs::remove_dir_all(&socket_dir);
+}
+
+// ---------------------------------------------------------------------------
 // Stream: URL events follow active main-frame navigation
 // ---------------------------------------------------------------------------
 
