@@ -352,8 +352,9 @@ pub struct LaunchOptions {
     /// Hide native scrollbars in headless Chromium screenshots by launching
     /// Chrome with `--hide-scrollbars`.
     pub hide_scrollbars: bool,
-    /// Initial viewport dimensions used for `--window-size` so the content
-    /// area matches the desired viewport from the start.
+    /// Width and height passed to Chrome as `--window-size`. This sizes the
+    /// window frame. A viewport chosen with `set viewport` is installed again
+    /// after launch, because the frame is not the page.
     pub viewport_size: Option<(u32, u32)>,
     /// When true, omit `--password-store=basic` and `--use-mock-keychain` so
     /// Chrome uses the real system keychain. Set automatically when launching
