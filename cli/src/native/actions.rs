@@ -695,8 +695,9 @@ pub struct DaemonState {
     pub engine: String,
     /// Default timeout for wait operations, from AGENT_BROWSER_DEFAULT_TIMEOUT env var.
     pub default_timeout_ms: u64,
-    /// Last viewport settings (width, height, deviceScaleFactor, mobile),
-    /// re-applied to new contexts (e.g., recording).
+    /// Last viewport from `set viewport` or `device`
+    /// (width, height, deviceScaleFactor, mobile). Installed again after a
+    /// launch. `--window-size` only sizes the window frame.
     pub viewport: Option<(i32, i32, f64, bool)>,
     /// Session-scoped setup applied to the active page, re-applied to tabs the
     /// daemon creates. See [`SessionSetup`].
@@ -4794,8 +4795,9 @@ async fn auto_launch_inner(
     state.plugin_init_scripts.clear();
     state.session_setup = SessionSetup::default();
 
-    // Use the stream server's viewport dimensions for --window-size so the
-    // content area matches the desired viewport from the start.
+    // `--window-size` sizes the window frame. The page is shorter than that
+    // frame by the browser chrome, so a viewport set earlier is installed
+    // again after the process is up.
     if let Some(ref server) = state.stream_server {
         options.viewport_size = Some(server.viewport().await);
     }
@@ -5055,7 +5057,34 @@ async fn auto_launch_inner(
     apply_launch_init_scripts(state, &enable_features, &init_script_paths).await;
     try_auto_restore_state(state).await;
     load_storage_state_for_launch(state, &storage_state_path, strict_state).await?;
+    restore_viewport_after_launch(state).await?;
     Ok(json!({}))
+}
+
+/// Installs the viewport from `set viewport` or `device` on a browser that
+/// just started.
+///
+/// `--window-size` sizes the window frame. The page is shorter than that
+/// frame by the browser chrome until `Emulation.setDeviceMetricsOverride`
+/// and `Browser.setContentsSize` run again. A session that has not set a
+/// viewport is left alone.
+async fn restore_viewport_after_launch(state: &mut DaemonState) -> Result<(), String> {
+    let Some((width, height, scale, mobile)) = state.viewport else {
+        return Ok(());
+    };
+    let result = {
+        let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+        mgr.set_viewport(width, height, scale, mobile).await
+    };
+    if let Err(err) = result {
+        if let Err(close_err) = rollback_failed_launch(state).await {
+            return Err(format!(
+                "{err} (also failed to roll back browser after launch: {close_err})"
+            ));
+        }
+        return Err(err);
+    }
+    Ok(())
 }
 
 fn string_array_from_command(cmd: &Value, key: &str) -> Option<Vec<String>> {
